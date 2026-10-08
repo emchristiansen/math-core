@@ -363,7 +363,7 @@ impl<'state> Emitter<'state> {
                     OpAttrs::empty()
                 };
                 emit_operator_attributes(&mut self.s, attrs, left, right)?;
-                write!(self.s, ">{name}</mo>")?;
+                write!(self.s, ">{}</mo>", EscapeHtml(name))?;
             }
             Node::IdentifierStr(letters) => {
                 // The "<mrow>" with "<mspace/>" is needed to prevent Firefox from adding
