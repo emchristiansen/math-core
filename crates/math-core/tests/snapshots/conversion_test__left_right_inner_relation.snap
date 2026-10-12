@@ -1,0 +1,15 @@
+---
+source: crates/math-core/tests/conversion_test.rs
+expression: "a=\\left(x\\right)=b"
+---
+<math>
+    <mi>a</mi>
+    <mo>=</mo>
+    <mrow>
+        <mo>(</mo>
+        <mi>x</mi>
+        <mo>)</mo>
+    </mrow>
+    <mo>=</mo>
+    <mi>b</mi>
+</math>

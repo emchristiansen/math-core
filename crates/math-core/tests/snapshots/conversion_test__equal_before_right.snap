@@ -7,7 +7,7 @@ expression: "\\left(x=\\right)x"
         <mo>(</mo>
         <mi>x</mi>
         <mo rspace="0">=</mo>
-        <mo>)</mo>
+        <mo rspace="0.1667em">)</mo>
     </mrow>
     <mi>x</mi>
 </math>
