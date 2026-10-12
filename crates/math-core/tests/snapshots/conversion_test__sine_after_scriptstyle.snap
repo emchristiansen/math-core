@@ -1,0 +1,15 @@
+---
+source: crates/math-core/tests/conversion_test.rs
+expression: "x\\scriptstyle\\sin y"
+---
+<math>
+    <mi>x</mi>
+    <mrow displaystyle="false" scriptlevel="1">
+        <mspace width="0.1667em"/>
+        <mrow>
+            <mrow><mspace/><mi>sin</mi></mrow>
+            <mo lspace="0.1667em">&ApplyFunction;</mo>
+            <mi>y</mi>
+        </mrow>
+    </mrow>
+</math>
