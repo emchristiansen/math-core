@@ -3,9 +3,9 @@ source: crates/math-core/tests/conversion_test.rs
 expression: "\\max\\nolimits_0\\limits^1\\displaylimits"
 ---
 <math>
-    <munderover>
-        <mo movablelimits="true" lspace="0" rspace="0">max</mo>
+    <msubsup>
+        <mrow><mspace/><mi>max</mi></mrow>
         <mn>0</mn>
         <mn>1</mn>
-    </munderover>
+    </msubsup>
 </math>

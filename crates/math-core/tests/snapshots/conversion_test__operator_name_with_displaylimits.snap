@@ -3,9 +3,9 @@ source: crates/math-core/tests/conversion_test.rs
 expression: "\\operatorname{max}\\displaylimits_x^y"
 ---
 <math>
-    <munderover>
-        <mo movablelimits="true" lspace="0" rspace="0">max</mo>
+    <msubsup>
+        <mrow><mspace/><mi>max</mi></mrow>
         <mi>x</mi>
         <mi>y</mi>
-    </munderover>
+    </msubsup>
 </math>

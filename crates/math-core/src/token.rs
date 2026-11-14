@@ -8,7 +8,7 @@ use mathml_renderer::{
     table::ColumnAlignment,
 };
 use mathml_renderer::{
-    attribute::{FracAttr, HtmlTextSize, HtmlTextStyle, Notation, OpAttrs, Size, Style},
+    attribute::{FracAttr, HtmlTextSize, HtmlTextStyle, Notation, OpAttrs, OpRoles, Size, Style},
     super_char::SuperChar,
 };
 use mathml_renderer::{length::Length, super_char::OverlayChar, table::LineType};
@@ -475,6 +475,7 @@ impl PrimeKind {
                     Node::Operator {
                         op: symbol::PRIME.as_op(),
                         attrs: OpAttrs::empty(),
+                        roles: OpRoles::empty(),
                         left: None,
                         right: None,
                         size: None,
@@ -486,6 +487,7 @@ impl PrimeKind {
                     Node::Operator {
                         op: symbol::DOUBLE_PRIME.as_op(),
                         attrs: OpAttrs::empty(),
+                        roles: OpRoles::empty(),
                         left: None,
                         right: None,
                         size: None,
@@ -497,6 +499,7 @@ impl PrimeKind {
                     Node::Operator {
                         op: symbol::TRIPLE_PRIME.as_op(),
                         attrs: OpAttrs::empty(),
+                        roles: OpRoles::empty(),
                         left: None,
                         right: None,
                         size: None,
@@ -508,6 +511,7 @@ impl PrimeKind {
                     Node::Operator {
                         op: symbol::QUADRUPLE_PRIME.as_op(),
                         attrs: OpAttrs::empty(),
+                        roles: OpRoles::empty(),
                         left: None,
                         right: None,
                         size: None,
@@ -519,6 +523,7 @@ impl PrimeKind {
                     Node::Operator {
                         op: symbol::REVERSED_PRIME.as_op(),
                         attrs: OpAttrs::empty(),
+                        roles: OpRoles::empty(),
                         left: None,
                         right: None,
                         size: None,
@@ -530,6 +535,7 @@ impl PrimeKind {
                     Node::Operator {
                         op: symbol::REVERSED_DOUBLE_PRIME.as_op(),
                         attrs: OpAttrs::empty(),
+                        roles: OpRoles::empty(),
                         left: None,
                         right: None,
                         size: None,
@@ -541,6 +547,7 @@ impl PrimeKind {
                     Node::Operator {
                         op: symbol::REVERSED_TRIPLE_PRIME.as_op(),
                         attrs: OpAttrs::empty(),
+                        roles: OpRoles::empty(),
                         left: None,
                         right: None,
                         size: None,
@@ -563,7 +570,8 @@ impl Token {
         match self.unwrap_math_ref() {
             Relation(_) | ForceRelation(_) | XArrow(_) => Some(Class::Relation),
             Punctuation(_) | ForcePunctuation(_) => Some(Class::Punctuation),
-            Open(_) | Left | SquareBracketOpen | ForceOpen(..) | Begin(_) | GroupBegin => {
+            Begin(env) if env.delimiters().is_some() => Some(Class::Inner),
+            Open(_) | SquareBracketOpen | ForceOpen(..) | Begin(_) | GroupBegin => {
                 Some(Class::Open)
             }
             Close(_) | SquareBracketClose | ForceClose(..) | Right | Middle => Some(Class::Close),
@@ -574,7 +582,7 @@ impl Token {
             | PseudoOperatorLimits(_)
             | OperatorName { .. } => Some(Class::Operator),
             End(_) | NewLine | NewColumn | GroupEnd | Eoi => Some(Class::End),
-            Inner(_) | ForceMathInner(_) | Dots => Some(Class::Inner),
+            Inner(_) | ForceMathInner(_) | Dots | Left => Some(Class::Inner),
             Big(_, Some(paren_type)) => Some(match paren_type {
                 ParenType::Left => Class::Open,
                 ParenType::Right => Class::Close,

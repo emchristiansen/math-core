@@ -8,6 +8,9 @@ fn main() {
         ("only_whitespace", r"  "),
         ("starts_with_whitespace", r"  x  "),
         ("newline", r"x\\y"),
+        ("newline_before_binary_op", r"a\\-b"),
+        ("newline_at_group_end", r"{x\\}"),
+        ("newline_as_arg", r"\frac\\ab"),
         ("text", r"\text{hi}xx"),
         ("text_multi_space", r"\text{x   y}"),
         ("text_with_comment", "\\text{x %comment\n   y}"),
@@ -108,8 +111,24 @@ fn main() {
         ("sine_sine", r"\sin\sin x"),
         ("sine_at_group_start", r"x{\sin x}"),
         ("sine_at_group_end", r"{x\sin}x"),
+        ("sine_alone_in_group", r"x{\sin}y"),
+        ("sine_alone_in_group_with_sub", r"x{\sin}_1 y"),
+        ("sine_in_mathrm_no_brackets", r"x\mathrm\sin y"),
+        ("sine_in_mathrm", r"x\mathrm{\sin}y"),
         ("sine_at_left", r"x\left(\sin x\right)"),
         ("sine_at_right", r"x\left(x\sin \right)x"),
+        ("sine_after_middle", r"\left(a\middle|\sin x\right)"),
+        ("sine_after_color", r"x\color{red}\sin y"),
+        ("sine_in_textcolor", r"\textcolor{red}{\sin}x"),
+        ("sine_after_scriptstyle", r"x\scriptstyle\sin y"),
+        ("sine_followed_by_punctuation", r"\sin ; x, \cos x; y"),
+        ("sine_negative_space", r"\sin\!x"),
+        ("sine_negative_space_after_argument", r"\sin x\!y"),
+        ("lim_displaystyle", r"\displaystyle\lim_{n\to\infty} a_n"),
+        (
+            "lim_in_underbrace_label",
+            r"\displaystyle\underbrace{x}_{\lim_n y}",
+        ),
         ("sine_with_displaylimits", r"\sin\displaylimits_0^1"),
         (
             "sine_mixed_limits",
@@ -147,6 +166,10 @@ fn main() {
         ("operator_name", r"\operatorname{sn} x"),
         ("operator_name_with_spaces", r"\operatorname{ hel lo }"),
         ("operator_name_with_single_char", r"\operatorname{a}"),
+        (
+            "operator_name_with_single_char_and_argument",
+            r"\operatorname{a} x",
+        ),
         ("operator_name_with_space_cmd", r"\operatorname{arg\,max}"),
         (
             "operator_name_with_text",
@@ -572,6 +595,28 @@ fn main() {
         ("equal_at_start_of_pseudo_row", r"x \displaystyle = x"),
         ("equal_at_start_of_pseudo_row_punct", r", \displaystyle = x"),
         ("equal_before_right", r"\left(x=\right)x"),
+        ("left_right_inner", r"x\left(\frac12\right)x"),
+        ("left_right_inner_at_boundaries", r"\left(x\right)"),
+        ("left_right_inner_after_open", r"(\left(x\right))"),
+        ("left_right_inner_relation", r"a=\left(x\right)=b"),
+        ("left_right_inner_punctuation", r"\left(x\right),y"),
+        ("left_right_inner_adjacent", r"\left(x\right)\left(y\right)"),
+        ("left_right_inner_missing_delims", r"x\left.y\right.z"),
+        ("left_right_inner_sup", r"\left(x\right)^2y"),
+        ("left_right_inner_sup_at_end", r"x\left(y\right)^2"),
+        ("left_right_inner_in_script", r"x^{a\left(y\right)b}"),
+        ("pmatrix_inner", r"x\begin{pmatrix}a\end{pmatrix}x"),
+        ("bmatrix_inner_sup", r"\begin{bmatrix}a\end{bmatrix}^T x"),
+        (
+            "vmatrix_inner_adjacent",
+            r"\begin{vmatrix}a\end{vmatrix}\begin{vmatrix}b\end{vmatrix}",
+        ),
+        ("cases_inner", r"x\begin{cases}a\end{cases}"),
+        ("rcases_inner", r"\begin{rcases}a\end{rcases}x"),
+        (
+            "mathinner_adjacent",
+            r"\mathinner{a}\mathinner{b}\cdots\cdots",
+        ),
         ("sqrt_equal_three", r"\sqrt{=3}"),
         ("equal_squared", r"==^2 x"),
         ("equal_vectored", r"=\vec{=}x"),
@@ -655,6 +700,47 @@ fn main() {
         (
             "vmatrix_hline",
             r"\begin{vmatrix} 1 & 2 \\ \hline 3 & 4 \end{vmatrix}",
+        ),
+        (
+            "matrix_color_ends_at_column",
+            r"\begin{matrix}\color{red} a & b\end{matrix}",
+        ),
+        (
+            "matrix_color_ends_at_row",
+            r"\begin{matrix}\color{red} a \\ \hline b\end{matrix}",
+        ),
+        (
+            "matrix_style_ends_at_column",
+            r"\begin{matrix}\displaystyle \sum & \sum\end{matrix}",
+        ),
+        ("color_continues_past_newline", r"\color{red}a\\ b"),
+        (
+            "align_color_ends_at_row",
+            r"\begin{align}\color{red} a &= b \\ c &= d\end{align}",
+        ),
+        (
+            "matrix_over_in_cell",
+            r"\begin{matrix} a \over b & c \end{matrix}",
+        ),
+        (
+            "matrix_infix_frac_per_cell",
+            r"\begin{matrix} x & a \choose b \\ c \over d & e \end{matrix}",
+        ),
+        (
+            "matrix_over_style_ends_with_cell",
+            r"\begin{matrix} a \over b & \mathchoice{D}{T}{S}{s} \end{matrix}",
+        ),
+        (
+            "matrix_font_switch_ends_with_cell",
+            r"\begin{matrix} \bf a & b \\ c \end{matrix}",
+        ),
+        (
+            "matrix_font_switch_outside_env",
+            r"\bf \begin{matrix} a & b \end{matrix}",
+        ),
+        (
+            "matrix_script_at_cell_start",
+            r"\begin{matrix} a &^2 b \\ _1 c \end{matrix}",
         ),
         (
             "subarray",
@@ -875,7 +961,7 @@ fn main() {
         pretty_print: PrettyPrint::Always,
         ..Default::default()
     };
-    let converter = LatexToMathML::new(config).unwrap();
+    let converter = LatexToMathML::new(config, vec![]).unwrap();
     for (name, problem) in problems.into_iter() {
         let mathml = converter
             .convert_with_local_state(problem, MathDisplay::Inline)
@@ -898,7 +984,7 @@ fn forward_references_test() {
         pretty_print: PrettyPrint::Always,
         ..Default::default()
     };
-    let converter = LatexToMathML::new(config).unwrap();
+    let converter = LatexToMathML::new(config, vec![]).unwrap();
     let result = converter.convert_all(&latex_snippets);
     let snippet1 = result[0].as_ref().unwrap();
     let snippet2 = result[1].as_ref().unwrap();

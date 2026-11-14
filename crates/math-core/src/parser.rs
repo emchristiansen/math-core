@@ -8,7 +8,7 @@ use kstring::KString;
 use mathml_renderer::{
     arena::{Arena, Buffer},
     ast::{MultiscriptPair, Node},
-    attribute::{FracAttr, LetterAttr, MathSpacing, OpAttrs, RowAttrs, Style},
+    attribute::{FracAttr, LetterAttr, MathSpacing, OpAttrs, OpRoles, RowAttrs, Style},
     length::{Length, LengthSet, LengthUnit},
     super_char::SuperChar,
     symbol::{self, OpCategory, OrdCategory, OrdLike, RelCategory},
@@ -19,7 +19,8 @@ use crate::{
     ParserConfig,
     atof::limited_float_parse,
     character_class::{
-        Class, DelimiterSpacing, MathVariant, ParenType, StretchableOp, Stretchy, fenced,
+        Class, DelimiterSpacing, FenceOptions, MathVariant, ParenType, StretchableOp, Stretchy,
+        fenced,
     },
     color_defs::get_color,
     custom_cmds::RecordedToken,
@@ -30,7 +31,7 @@ use crate::{
     error::{DelimiterModifier, LatexErrKind, LatexError, LimitedUsabilityToken, Place},
     global_state::GlobalState,
     lexer::{Lexer, recover_limited_ascii},
-    predefined,
+    predefined, semantic,
     specifications::{LatexUnit, parse_column_specification, parse_length_specification},
     split_on_ascii::split_on_ascii,
     text_parser::TextSnippet,
@@ -82,13 +83,20 @@ enum SequenceEnd {
 
 impl SequenceEnd {
     #[inline]
-    fn matches(self, other: &Token) -> bool {
+    fn matches(self, other: &Token, meaningful_newlines: bool) -> bool {
         match self {
             SequenceEnd::EndToken(token) => token.matches(other),
-            SequenceEnd::AnyEndToken => matches!(
-                other,
-                Token::Eoi | Token::GroupEnd | Token::End(_) | Token::Right
-            ),
+            SequenceEnd::AnyEndToken => match other {
+                // In a table, each cell is its own group, so a switch like `\color` only
+                // extends to the end of the cell. Outside of a table, `&` is an error anyway.
+                Token::Eoi | Token::GroupEnd | Token::End(_) | Token::Right | Token::NewColumn => {
+                    true
+                }
+                // Where `\\` is not meaningful, it is ignored, so a switch like `\color`
+                // continues past it.
+                Token::NewLine => meaningful_newlines,
+                _ => false,
+            },
         }
     }
 }
@@ -193,6 +201,24 @@ impl<'state, 'arena> Parser<'state, 'arena> {
         self.parse_sequence(sequence_end, prev_class, keep_end_token)
     }
 
+    /// Parse a sequence nested in a group (like `{...}`, `\left...\right` or `[...]`) until
+    /// the given end token is encountered.
+    ///
+    /// Inside such a group, the `&` and `\\` of a surrounding table environment cannot be
+    /// used.
+    fn parse_nested_sequence(
+        &mut self,
+        end_token: EndToken,
+        prev_class: Class,
+        keep_end_token: bool,
+    ) -> ParseResult<Vec<&'arena Node<'arena>>> {
+        let old_nested = mem::replace(&mut self.state.env.nested, true);
+        let nodes =
+            self.parse_sequence(SequenceEnd::EndToken(end_token), prev_class, keep_end_token);
+        self.state.env.nested = old_nested;
+        nodes
+    }
+
     /// Parse a sequence of tokens until the given end token is encountered.
     ///
     /// If `keep_end_token` is set to `true`, this function does not consume the end token.
@@ -206,13 +232,18 @@ impl<'state, 'arena> Parser<'state, 'arena> {
     ) -> ParseResult<Vec<&'arena Node<'arena>>> {
         let mut nodes = Vec::new();
         let mut infix_frac: Option<(Vec<&'arena Node<'arena>>, bool, Option<InfixDelim>)> = None;
+        // Index in `nodes` where the current table cell starts. Outside of tables, this stays 0.
+        let mut cell_start = 0;
 
         let mut prev_class = prev_class;
         let old_tf = self.state.transform;
         let old_style = self.state.style;
 
         // Because we don't want to consume the end token, we just peek here.
-        while !sequence_end.matches(self.tokens.peek().token()) {
+        while !sequence_end.matches(
+            self.tokens.peek().token(),
+            self.state.env.meaningful_newlines,
+        ) {
             // Check whether we need to collect letters.
             let (class, target) = if let Some(collected) = self.merge_and_transform_letters()? {
                 collected
@@ -224,6 +255,7 @@ impl<'state, 'arena> Parser<'state, 'arena> {
                         tokloc,
                         sequence_end,
                         &mut nodes,
+                        cell_start,
                         &mut infix_frac,
                     )? {
                         ControlFlow::SkipToken => continue,
@@ -234,6 +266,23 @@ impl<'state, 'arena> Parser<'state, 'arena> {
                 self.parse_token(cur_tokloc, ParseAs::Sequence, prev_class)?
             };
             prev_class = class;
+
+            if matches!(target, Node::ColumnSeparator | Node::RowSeparator { .. }) {
+                // In a table, each cell is its own group, so an infix fraction ends with the cell.
+                if let Some((numerator, with_line, delim)) = infix_frac.take() {
+                    let denominator = nodes.split_off(cell_start);
+                    let frac = self.infix_frac_node(&numerator, &denominator, with_line, delim);
+                    nodes.push(frac);
+                }
+                // Font switches like `\bf`, and the smaller style for the denominator of an
+                // infix fraction, also end with the cell.
+                self.state.transform = old_tf;
+                self.state.style = old_style;
+                // The separator can't take any sub- or superscripts; these start the next cell.
+                nodes.push(target);
+                cell_start = nodes.len();
+                continue;
+            }
 
             // Check if there are any superscripts or subscripts following the parsed node.
             let bounds = self.get_bounds(None)?.ensure_no_explicit_limits()?;
@@ -261,36 +310,9 @@ impl<'state, 'arena> Parser<'state, 'arena> {
             // one of the node types for superscripts and subscripts.
         }
         if let Some((numerator, with_line, delim)) = infix_frac {
-            let denominator = mem::replace(&mut nodes, Vec::with_capacity(1));
-            let (lt_value, lt_unit) = if with_line {
-                Length::none().into_parts()
-            } else {
-                Length::zero().into_parts()
-            };
-            let frac = self.commit(Node::Frac {
-                num: node_vec_to_node(self.arena, &numerator, false),
-                denom: node_vec_to_node(self.arena, &denominator, false),
-                lt_value,
-                lt_unit,
-                attr: None,
-            });
-            let node = if let Some(delim) = delim {
-                let (open, close) = match delim {
-                    InfixDelim::Paren => (OPEN_PAREN, CLOSE_PAREN),
-                    InfixDelim::Brace => (OPEN_BRACE, CLOSE_BRACE),
-                    InfixDelim::Brack => (OPEN_BRACKET, CLOSE_BRACKET),
-                };
-                self.commit(fenced(
-                    self.arena,
-                    vec![frac],
-                    Some(open),
-                    Some(close),
-                    None,
-                ))
-            } else {
-                frac
-            };
-            nodes.push(node);
+            let denominator = nodes.split_off(cell_start);
+            let frac = self.infix_frac_node(&numerator, &denominator, with_line, delim);
+            nodes.push(frac);
         }
         if !keep_end_token {
             // Discard the end token.
@@ -301,12 +323,53 @@ impl<'state, 'arena> Parser<'state, 'arena> {
         Ok(nodes)
     }
 
+    /// Build the fraction for an infix command like `\over` or `\choose`.
+    fn infix_frac_node(
+        &self,
+        numerator: &[&'arena Node<'arena>],
+        denominator: &[&'arena Node<'arena>],
+        with_line: bool,
+        delim: Option<InfixDelim>,
+    ) -> &'arena Node<'arena> {
+        let (lt_value, lt_unit) = if with_line {
+            Length::none().into_parts()
+        } else {
+            Length::zero().into_parts()
+        };
+        let frac = self.commit(Node::Frac {
+            num: semantic::enrich_to_node(self.arena, numerator, false),
+            denom: semantic::enrich_to_node(self.arena, denominator, false),
+            lt_value,
+            lt_unit,
+            attr: None,
+        });
+        if let Some(delim) = delim {
+            let (open, close) = match delim {
+                InfixDelim::Paren => (OPEN_PAREN, CLOSE_PAREN),
+                InfixDelim::Brace => (OPEN_BRACE, CLOSE_BRACE),
+                InfixDelim::Brack => (OPEN_BRACKET, CLOSE_BRACKET),
+            };
+            self.commit(fenced(
+                self.arena,
+                vec![frac],
+                FenceOptions {
+                    open: Some(open),
+                    close: Some(close),
+                    ..FenceOptions::default()
+                },
+            ))
+        } else {
+            frac
+        }
+    }
+
     #[inline]
     fn handle_tokens_without_output(
         &mut self,
         tokspan: &TokSpan,
         sequence_end: SequenceEnd,
         collected_nodes: &mut Vec<&'arena Node<'arena>>,
+        cell_start: usize,
         infix_frac: &mut Option<(Vec<&'arena Node<'arena>>, bool, Option<InfixDelim>)>,
     ) -> ParseResult<ControlFlow> {
         let span = tokspan.span().into();
@@ -321,10 +384,13 @@ impl<'state, 'arena> Parser<'state, 'arena> {
             }
             Token::InfixGenFrac { with_line, delim } => {
                 if infix_frac.is_none() {
-                    *infix_frac = Some((mem::take(collected_nodes), with_line, delim));
+                    // In a table, the numerator only extends to the start of the current cell.
+                    let numerator = collected_nodes.split_off(cell_start);
+                    *infix_frac = Some((numerator, with_line, delim));
                     // The numerator was already parsed in the surrounding style (we only
                     // learn it's a fraction here), but we can at least shrink the style
-                    // for the denominator. `parse_sequence` restores the style on exit.
+                    // for the denominator. `parse_sequence` restores the style at the end
+                    // of the cell or on exit.
                     self.state.style = self.state.style.shrink();
                     Ok(())
                 } else {
@@ -334,6 +400,10 @@ impl<'state, 'arena> Parser<'state, 'arena> {
             // In a sequence, `\relax` really does produce nothing at all. In an argument it
             // has to produce an empty group instead; see `parse_token`.
             Token::Relax => Ok(()),
+            // Where `\\` is not meaningful (outside of tables, or in `equation`), LaTeX ignores it.
+            // As with `\relax`, it produces nothing in a sequence and an empty group in an
+            // argument.
+            Token::NewLine if !self.state.env.meaningful_newlines => Ok(()),
             Token::TransformSwitch(tf) => {
                 self.state.transform = Some(tf);
                 Ok(())
@@ -530,6 +600,7 @@ impl<'state, 'arena> Parser<'state, 'arena> {
                 Ok(Node::Operator {
                     op: relation.as_op(),
                     attrs,
+                    roles: OpRoles::ROLE_INFIX,
                     left,
                     right,
                     size: None,
@@ -541,6 +612,8 @@ impl<'state, 'arena> Parser<'state, 'arena> {
                 Ok(Node::Operator {
                     op: punc.as_op(),
                     attrs: OpAttrs::empty(),
+                    // Punctuation separates formulas; it can't be, e.g., the argument of `\sin`.
+                    roles: OpRoles::ROLE_INFIX,
                     left,
                     right,
                     size: None,
@@ -552,6 +625,7 @@ impl<'state, 'arena> Parser<'state, 'arena> {
                 Ok(Node::Operator {
                     op,
                     attrs: OpAttrs::empty(),
+                    roles: OpRoles::ROLE_PREFIX | OpRoles::ROLE_INFIX | OpRoles::ROLE_POSTFIX,
                     left,
                     right,
                     size: None,
@@ -582,6 +656,7 @@ impl<'state, 'arena> Parser<'state, 'arena> {
                 let target = self.commit(Node::Operator {
                     op,
                     attrs,
+                    roles: OpRoles::ROLE_PREFIX | OpRoles::ROLE_INFIX | OpRoles::ROLE_POSTFIX,
                     left,
                     right,
                     size: None,
@@ -618,6 +693,7 @@ impl<'state, 'arena> Parser<'state, 'arena> {
                     break 'ord Ok(Node::Operator {
                         op: ord.as_op(),
                         attrs,
+                        roles: OpRoles::ROLE_INFIX,
                         left: spacing,
                         right: spacing,
                         size: None,
@@ -648,6 +724,7 @@ impl<'state, 'arena> Parser<'state, 'arena> {
                 };
                 Ok(Node::Operator {
                     op: ord.as_op(),
+                    roles: OpRoles::ROLE_INFIX,
                     attrs,
                     left,
                     right,
@@ -659,6 +736,7 @@ impl<'state, 'arena> Parser<'state, 'arena> {
                 Ok(Node::Operator {
                     op,
                     attrs: OpAttrs::empty(),
+                    roles: OpRoles::ROLE_INFIX,
                     left: Some(MathSpacing::Zero),
                     right: Some(MathSpacing::Zero),
                     size: None,
@@ -681,6 +759,7 @@ impl<'state, 'arena> Parser<'state, 'arena> {
                 Ok(Node::Operator {
                     op: binary_op.as_op(),
                     attrs: OpAttrs::empty(),
+                    roles: OpRoles::ROLE_INFIX,
                     left: spacing,
                     right: spacing,
                     size: None,
@@ -700,6 +779,7 @@ impl<'state, 'arena> Parser<'state, 'arena> {
                 Ok(Node::Operator {
                     op,
                     attrs: OpAttrs::empty(),
+                    roles: OpRoles::ROLE_INFIX,
                     left: spacing,
                     right: spacing,
                     size: None,
@@ -754,12 +834,14 @@ impl<'state, 'arena> Parser<'state, 'arena> {
                     Node::Operator {
                         op,
                         attrs,
+                        roles,
                         size,
                         left: _,
                         right: _,
                     } => Ok(Node::Operator {
                         op,
                         attrs: attrs | OpAttrs::STRETCHY_FALSE,
+                        roles,
                         left,
                         right,
                         size,
@@ -776,6 +858,7 @@ impl<'state, 'arena> Parser<'state, 'arena> {
                         // An empty `<mo></mo>` produces no spacing in Firefox
                         op: const { symbol::INVISIBLE_SEPARATOR.as_op() },
                         attrs: OpAttrs::empty(),
+                        roles: OpRoles::empty(),
                         left,
                         right,
                         size: None,
@@ -796,6 +879,7 @@ impl<'state, 'arena> Parser<'state, 'arena> {
                 Ok(Node::Operator {
                     op: op.as_op(),
                     attrs: OpAttrs::empty(),
+                    roles: OpRoles::ROLE_INFIX | OpRoles::ROLE_PREFIX | OpRoles::ROLE_POSTFIX,
                     left,
                     right,
                     size: None,
@@ -807,6 +891,7 @@ impl<'state, 'arena> Parser<'state, 'arena> {
                 Ok(Node::Operator {
                     op,
                     attrs: OpAttrs::empty(),
+                    roles: OpRoles::empty(),
                     left,
                     right,
                     size: None,
@@ -861,14 +946,18 @@ impl<'state, 'arena> Parser<'state, 'arena> {
                     && matches!(tokloc.token(), Token::SquareBracketOpen)
                 {
                     // FIXME: We should perhaps use set `right_boundary_hack` here.
-                    let degree = self.parse_sequence(
-                        SequenceEnd::EndToken(EndToken::SquareBracketClose),
+                    // The index of `<mroot>` is two script levels smaller than the base.
+                    let degree_style = self.state.style.scriptify().scriptify();
+                    let old_style = mem::replace(&mut self.state.style, degree_style);
+                    let degree = self.parse_nested_sequence(
+                        EndToken::SquareBracketClose,
                         Class::Open,
                         false,
                     )?;
+                    self.state.style = old_style;
                     let content = self.parse_next(ParseAs::Arg)?;
                     Ok(Node::Root(
-                        node_vec_to_node(self.arena, &degree, true),
+                        semantic::enrich_to_node(self.arena, &degree, true),
                         content,
                     ))
                 } else {
@@ -898,9 +987,11 @@ impl<'state, 'arena> Parser<'state, 'arena> {
                             lt_unit,
                             attr,
                         })],
-                        Some(OPEN_PAREN),
-                        Some(CLOSE_PAREN),
-                        None,
+                        FenceOptions {
+                            open: Some(OPEN_PAREN),
+                            close: Some(CLOSE_PAREN),
+                            ..FenceOptions::default()
+                        },
                     ))
                 } else {
                     let (lt_value, lt_unit) = Length::none().into_parts();
@@ -966,8 +1057,11 @@ impl<'state, 'arena> Parser<'state, 'arena> {
                 } else {
                     None
                 };
+                let inner_style = style.unwrap_or(self.state.style).shrink();
+                let old_style = mem::replace(&mut self.state.style, inner_style);
                 let num = self.parse_next(ParseAs::Arg)?;
                 let denom = self.parse_next(ParseAs::Arg)?;
+                self.state.style = old_style;
                 let attr = None;
                 let (lt_value, lt_unit) = lt.into_parts();
                 Ok(fenced(
@@ -979,9 +1073,12 @@ impl<'state, 'arena> Parser<'state, 'arena> {
                         lt_unit,
                         attr,
                     })],
-                    open,
-                    close,
-                    style,
+                    FenceOptions {
+                        open,
+                        close,
+                        style,
+                        ..FenceOptions::default()
+                    },
                 ))
             }
             Token::Accent(op, is_over, attr) => {
@@ -1020,7 +1117,10 @@ impl<'state, 'arena> Parser<'state, 'arena> {
                 {
                     let target = self.commit(base);
                     self.next_token()?; // Discard the circumflex or underscore token.
+                    let label_style = self.state.style.scriptify();
+                    let old_style = mem::replace(&mut self.state.style, label_style);
                     let expl = self.parse_next(ParseAs::Arg)?;
+                    self.state.style = old_style;
                     if is_over {
                         Ok(Node::Over {
                             symbol: expl,
@@ -1066,6 +1166,11 @@ impl<'state, 'arena> Parser<'state, 'arena> {
                 let target = self.commit(Node::Operator {
                     op: op.as_op(),
                     attrs,
+                    roles: match op.category() {
+                        OpCategory::C => OpRoles::ROLE_INFIX,
+                        OpCategory::H | OpCategory::J => OpRoles::ROLE_PREFIX,
+                        OpCategory::CJ => OpRoles::ROLE_INFIX | OpRoles::ROLE_PREFIX,
+                    },
                     left,
                     right,
                     size: None,
@@ -1089,23 +1194,16 @@ impl<'state, 'arena> Parser<'state, 'arena> {
                 let bounds = bounds_limits.bounds;
 
                 let limits_by_default = matches!(tok, Token::PseudoOperatorLimits(_));
-                let (use_underover, force_movable_limits) =
-                    match (bounds_limits.limits(), limits_by_default) {
-                        _ if bounds.is_trivial() => (false, false),
-                        (None, true) | (Some(LimitsKind::Display), _) => (true, true),
-                        (None, false) | (Some(LimitsKind::Never), _) => (false, false),
-                        (Some(LimitsKind::Always), _) => (true, false),
-                    };
+                let use_underover = self.pseudo_op_uses_underover(
+                    bounds,
+                    bounds_limits.limits(),
+                    limits_by_default,
+                );
 
                 // Compute spacing after getting the bounds, so that we don't
                 // consider tokens that are part of the bounds for spacing calculations.
                 let (left, right) = self.mathop_spacing(parse_as, prev_class, true)?;
-                let target = self.commit(Node::PseudoOp {
-                    force_movable_limits,
-                    left,
-                    right,
-                    name,
-                });
+                let target = self.commit(Node::PseudoOp { left, right, name });
 
                 if use_underover {
                     match bounds.try_wrap_node_underover(target) {
@@ -1158,12 +1256,14 @@ impl<'state, 'arena> Parser<'state, 'arena> {
                     Node::Operator {
                         op,
                         attrs,
+                        roles,
                         size,
                         left,
                         right,
                     } => Ok(Node::Operator {
                         op: op.with_overlay(overlay),
                         attrs,
+                        roles,
                         size,
                         left,
                         right,
@@ -1174,24 +1274,14 @@ impl<'state, 'arena> Parser<'state, 'arena> {
                         letter_attr,
                     )),
 
-                    Node::PseudoOp {
-                        name,
-                        force_movable_limits,
-                        left,
-                        right,
-                    } => {
+                    Node::PseudoOp { name, left, right } => {
                         let mut builder = self.buffer.get_builder();
                         let insert_idx = after_first_char_and_vs(name);
                         builder.push_str(&name[..insert_idx]);
                         builder.push_char(overlay.into());
                         builder.push_str(&name[insert_idx..]);
                         let name = builder.finish(self.arena);
-                        Ok(Node::PseudoOp {
-                            name,
-                            force_movable_limits,
-                            left,
-                            right,
-                        })
+                        Ok(Node::PseudoOp { name, left, right })
                     }
 
                     Node::IdentifierStr(str) => {
@@ -1209,8 +1299,16 @@ impl<'state, 'arena> Parser<'state, 'arena> {
             }
             Token::Transform(tf) => {
                 let old_tf = self.state.transform.replace(tf);
-                let content = self.parse_next(ParseAs::Arg)?;
+                let mut content = self.parse_next(ParseAs::Arg)?;
                 self.state.transform = old_tf;
+                if parse_as.in_sequence() {
+                    // Rewrite the pseudo operator *now* before we see the arguments.
+                    if let Some((identifier, _)) =
+                        semantic::rewrite_pseudo_operator(content, self.arena)
+                    {
+                        content = identifier;
+                    }
+                }
                 return Ok(Parsed::Node(Class::Close, content));
             }
             Token::TransformSwitch(_)
@@ -1236,6 +1334,7 @@ impl<'state, 'arena> Parser<'state, 'arena> {
                 Ok(Node::Operator {
                     op,
                     attrs: OpAttrs::empty(),
+                    roles: OpRoles::ROLE_INFIX,
                     left,
                     right,
                     size: None,
@@ -1246,6 +1345,7 @@ impl<'state, 'arena> Parser<'state, 'arena> {
                 Ok(Node::Operator {
                     op,
                     attrs: OpAttrs::FORM_PREFIX,
+                    roles: OpRoles::ROLE_OPEN,
                     left: Some(MathSpacing::Zero),
                     right: Some(MathSpacing::Zero),
                     size: None,
@@ -1256,14 +1356,15 @@ impl<'state, 'arena> Parser<'state, 'arena> {
                 Ok(Node::Operator {
                     op,
                     attrs: OpAttrs::FORM_POSTFIX,
+                    roles: OpRoles::ROLE_CLOSE,
                     left: Some(MathSpacing::Zero),
                     right: Some(MathSpacing::Zero),
                     size: None,
                 })
             }
             Token::GroupBegin => {
-                let content = self.parse_sequence(
-                    SequenceEnd::EndToken(EndToken::GroupClose),
+                let content = self.parse_nested_sequence(
+                    EndToken::GroupClose,
                     if matches!(parse_as, ParseAs::ContinueSequence) {
                         prev_class
                     } else {
@@ -1271,10 +1372,20 @@ impl<'state, 'arena> Parser<'state, 'arena> {
                     },
                     false,
                 )?;
-                return Ok(Parsed::Node(
-                    Class::Default,
-                    node_vec_to_node(self.arena, &content, matches!(parse_as, ParseAs::Arg)),
-                ));
+                let mut node = semantic::enrich_to_node(
+                    self.arena,
+                    &content,
+                    matches!(parse_as, ParseAs::Arg),
+                );
+                if parse_as.in_sequence() {
+                    // Rewrite the pseudo operator *now* before we see the arguments.
+                    if let Some((identifier, _)) =
+                        semantic::rewrite_pseudo_operator(node, self.arena)
+                    {
+                        node = identifier;
+                    }
+                }
+                return Ok(Parsed::Node(Class::Default, node));
             }
             ref tok @ (Token::Open(paren) | Token::Close(paren)) => {
                 let open = matches!(tok, Token::Open(_));
@@ -1307,9 +1418,15 @@ impl<'state, 'arena> Parser<'state, 'arena> {
                     // so we have to explicitly disable that here.
                     attrs |= OpAttrs::STRETCHY_FALSE;
                 }
+                let roles = if open {
+                    OpRoles::ROLE_OPEN
+                } else {
+                    OpRoles::ROLE_CLOSE
+                };
                 Ok(Node::Operator {
                     op: paren.as_op(),
                     attrs,
+                    roles,
                     left: None,
                     right: None,
                     size: None,
@@ -1320,6 +1437,7 @@ impl<'state, 'arena> Parser<'state, 'arena> {
                 Ok(Node::Operator {
                     op: symbol::LEFT_SQUARE_BRACKET.as_op(),
                     attrs: OpAttrs::STRETCHY_FALSE,
+                    roles: OpRoles::ROLE_OPEN,
                     left: None,
                     right: None,
                     size: None,
@@ -1328,6 +1446,7 @@ impl<'state, 'arena> Parser<'state, 'arena> {
             Token::SquareBracketClose => Ok(Node::Operator {
                 op: symbol::RIGHT_SQUARE_BRACKET.as_op(),
                 attrs: OpAttrs::STRETCHY_FALSE,
+                roles: OpRoles::ROLE_CLOSE,
                 left: None,
                 right: None,
                 size: None,
@@ -1339,18 +1458,17 @@ impl<'state, 'arena> Parser<'state, 'arena> {
                 } else {
                     Some(extract_delimiter(tok_loc, DelimiterModifier::Left)?)
                 };
-                let content = self.parse_sequence(
-                    SequenceEnd::EndToken(EndToken::Right),
-                    Class::Open,
-                    false,
-                )?;
+                let content = self.parse_nested_sequence(EndToken::Right, Class::Open, false)?;
+                let content = semantic::enrich(self.arena, &content);
                 let tok_loc = self.next_token()?;
                 let close_paren = if matches!(tok_loc.token(), &FULL_STOP_TOKEN) {
                     None
                 } else {
                     Some(extract_delimiter(tok_loc, DelimiterModifier::Right)?)
                 };
-                Ok(fenced(self.arena, content, open_paren, close_paren, None))
+                // From the outside, `\left...\right` is a `mathinner` atom.
+                class = Class::Inner;
+                Ok(self.inner_fence(content, open_paren, close_paren, parse_as, prev_class)?)
             }
             Token::Middle => {
                 class = Class::Open;
@@ -1364,6 +1482,7 @@ impl<'state, 'arena> Parser<'state, 'arena> {
                 Ok(Node::Operator {
                     op: op.as_op(),
                     attrs: middle_stretch_attrs(op),
+                    roles: OpRoles::empty(),
                     left: spacing,
                     right: spacing,
                     size: None,
@@ -1386,6 +1505,12 @@ impl<'state, 'arena> Parser<'state, 'arena> {
                     }
                     Stretchy::AlwaysAsymmetric => OpAttrs::SYMMETRIC_TRUE,
                     Stretchy::Always => OpAttrs::empty(),
+                };
+                // Semantic role from paren type
+                let roles = match paren_type {
+                    Some(ParenType::Left) => OpRoles::ROLE_OPEN,
+                    Some(ParenType::Right) => OpRoles::ROLE_CLOSE,
+                    Some(ParenType::Middle) | None => OpRoles::ROLE_INFIX,
                 };
                 // Determine form and spacing attributes based on paren_type
                 // and delimiter spacing.
@@ -1432,6 +1557,7 @@ impl<'state, 'arena> Parser<'state, 'arena> {
                 Ok(Node::Operator {
                     op: paren.as_op(),
                     attrs,
+                    roles,
                     size: Some(size),
                     left,
                     right,
@@ -1549,17 +1675,23 @@ impl<'state, 'arena> Parser<'state, 'arena> {
                 } else {
                     (None, None)
                 };
-                class = Class::Close;
-
-                Ok(env.construct_node(
+                let node = env.construct_node(
                     content,
                     array_spec,
-                    self.arena,
                     last_row_info,
                     num_rows,
                     border_top,
                     initial_shove,
-                ))
+                );
+                if let Some((open, close)) = env.delimiters() {
+                    // Like `\left...\right`, this is a `mathinner` atom.
+                    class = Class::Inner;
+                    let content = vec![self.commit(node)];
+                    Ok(self.inner_fence(content, open, close, parse_as, prev_class)?)
+                } else {
+                    class = Class::Close;
+                    Ok(node)
+                }
             }
             Token::OperatorName { with_limits } => {
                 class = Class::Operator;
@@ -1572,19 +1704,13 @@ impl<'state, 'arena> Parser<'state, 'arena> {
                 let bounds_limits = self.get_bounds(None)?;
                 let bounds = bounds_limits.bounds;
 
-                let (use_underover, force_movable_limits) =
-                    match (bounds_limits.limits(), with_limits) {
-                        _ if bounds.is_trivial() => (false, false),
-                        (None, true) | (Some(LimitsKind::Display), _) => (true, true),
-                        (None, false) | (Some(LimitsKind::Never), _) => (false, false),
-                        (Some(LimitsKind::Always), _) => (true, false),
-                    };
+                let use_underover =
+                    self.pseudo_op_uses_underover(bounds, bounds_limits.limits(), with_limits);
 
                 // Compute spacing after getting the bounds, so that we don't
                 // consider tokens that are part of the bounds for spacing calculations.
                 let (left, right) = self.mathop_spacing(parse_as, prev_class, true)?;
                 let op = self.commit(Node::PseudoOp {
-                    force_movable_limits,
                     left,
                     right,
                     name: letters,
@@ -1632,7 +1758,7 @@ impl<'state, 'arena> Parser<'state, 'arena> {
                     .collect::<Vec<_>>();
                 return Ok(Parsed::Node(
                     Class::Close,
-                    node_vec_to_node(self.arena, &nodes, false),
+                    node_vec_to_node(self.arena, &nodes),
                 ));
             }
             Token::RaiseBox => {
@@ -1686,14 +1812,11 @@ impl<'state, 'arena> Parser<'state, 'arena> {
                     .collect::<Vec<_>>();
                 return Ok(Parsed::Node(
                     Class::Close,
-                    node_vec_to_node(self.arena, &nodes, false),
+                    semantic::enrich_to_node(self.arena, &nodes, false),
                 ));
             }
             Token::NewColumn => {
-                if self.state.env.allow_columns {
-                    class = Class::Close;
-                    Ok(Node::ColumnSeparator)
-                } else {
+                if !self.state.env.allow_columns {
                     Err(LatexError(
                         span.into(),
                         LatexErrKind::CannotBeUsedHere {
@@ -1701,6 +1824,17 @@ impl<'state, 'arena> Parser<'state, 'arena> {
                             correct_place: Place::TableEnv,
                         },
                     ))
+                } else if self.state.env.nested || !matches!(parse_as, ParseAs::Sequence) {
+                    Err(LatexError(
+                        span.into(),
+                        LatexErrKind::CannotBeUsedHere {
+                            got: LimitedUsabilityToken::Ampersand,
+                            correct_place: Place::TableEnvTopLevel,
+                        },
+                    ))
+                } else {
+                    class = Class::Close;
+                    Ok(Node::ColumnSeparator)
                 }
             }
             tok @ (Token::HLine(_) | Token::Shove(_) | Token::Limits(_)) => {
@@ -1716,11 +1850,20 @@ impl<'state, 'arena> Parser<'state, 'arena> {
                 ))
             }
             Token::NewLine => 'new_line: {
-                class = Class::Open;
                 if !self.state.env.meaningful_newlines {
-                    // FIXME: Return something other than a row here, so that we can avoid creating
-                    //       empty rows in places where they are not needed.
+                    // In a sequence, this is already skipped in `handle_tokens_without_output`,
+                    // so we only get here in an argument.
                     break 'new_line Ok(Node::EMPTY_ROW);
+                }
+                class = Class::Open;
+                if self.state.env.nested || !matches!(parse_as, ParseAs::Sequence) {
+                    break 'new_line Err(LatexError(
+                        span.into(),
+                        LatexErrKind::CannotBeUsedHere {
+                            got: LimitedUsabilityToken::NewLine,
+                            correct_place: Place::TableEnvTopLevel,
+                        },
+                    ));
                 }
                 // A `\hline`/`\hdashline` directly after the `\\` (whitespace is skipped by `peek`)
                 // becomes the top border of the row that follows. Only legal inside an array or
@@ -1978,6 +2121,7 @@ impl<'state, 'arena> Parser<'state, 'arena> {
                     prev_class,
                     true,
                 )?;
+                let content = semantic::enrich(self.arena, &content);
                 Ok(Node::Row {
                     nodes: self.arena.push_slice(&content),
                     attrs: RowAttrs {
@@ -2018,6 +2162,7 @@ impl<'state, 'arena> Parser<'state, 'arena> {
                     true,
                 )?;
                 self.state.style = old_style;
+                let content = semantic::enrich(self.arena, &content);
                 Ok(Node::Row {
                     nodes: self.arena.push_slice(&content),
                     attrs: RowAttrs {
@@ -2092,6 +2237,7 @@ impl<'state, 'arena> Parser<'state, 'arena> {
                 let op_node = self.arena.push(Node::Operator {
                     op: op.as_op(),
                     attrs,
+                    roles: OpRoles::empty(),
                     size: None,
                     left,
                     right,
@@ -2210,12 +2356,12 @@ impl<'state, 'arena> Parser<'state, 'arena> {
                 let (under_arg, over_arg) = if let Ok(tokloc) = &next
                     && matches!(tokloc.token(), Token::SquareBracketOpen)
                 {
-                    let nodes = self.parse_sequence(
-                        SequenceEnd::EndToken(EndToken::SquareBracketClose),
+                    let nodes = self.parse_nested_sequence(
+                        EndToken::SquareBracketClose,
                         Class::Open,
                         false,
                     )?;
-                    let under = node_vec_to_node(self.arena, &nodes, false);
+                    let under = semantic::enrich_to_node(self.arena, &nodes, false);
                     let over = self.parse_next(ParseAs::Arg)?;
                     (Some(under), over)
                 } else {
@@ -2232,7 +2378,7 @@ impl<'state, 'arena> Parser<'state, 'arena> {
                 let label_space = &const { Node::Space(LatexUnit::Em.length_with_unit(3.5)) };
                 let over_label = self.commit(Node::Over {
                     symbol: label_space,
-                    target: node_vec_to_node(self.arena, &[pad, over_arg, pad], false),
+                    target: semantic::enrich_to_node(self.arena, &[pad, over_arg, pad], false),
                 });
 
                 // Stretchy relation: an arrow from the `A` relation category is stretchy
@@ -2248,6 +2394,7 @@ impl<'state, 'arena> Parser<'state, 'arena> {
                 let arrow = self.commit(Node::Operator {
                     op: rel.as_op(),
                     attrs,
+                    roles: OpRoles::empty(),
                     left,
                     right,
                     size: None,
@@ -2256,7 +2403,7 @@ impl<'state, 'arena> Parser<'state, 'arena> {
                 let center = if let Some(under_arg) = under_arg {
                     let under_label = self.commit(Node::Under {
                         symbol: label_space,
-                        target: node_vec_to_node(self.arena, &[pad, under_arg, pad], false),
+                        target: semantic::enrich_to_node(self.arena, &[pad, under_arg, pad], false),
                     });
                     self.commit(Node::UnderOver {
                         target: arrow,
@@ -2792,11 +2939,8 @@ impl<'state, 'arena> Parser<'state, 'arena> {
                 self.tokens.next()?; // skip over group begin token
 
                 let bounds = self.get_bounds(None)?;
-                let after_bounds = self.parse_sequence(
-                    SequenceEnd::EndToken(EndToken::GroupClose),
-                    Class::Open,
-                    false,
-                )?;
+                let after_bounds =
+                    self.parse_nested_sequence(EndToken::GroupClose, Class::Open, false)?;
                 Ok((bounds, after_bounds))
             }
             Token::Limits(kind) => {
@@ -2872,6 +3016,7 @@ impl<'state, 'arena> Parser<'state, 'arena> {
                     nodes.push(self.commit(Node::Operator {
                         op: op.as_op(),
                         attrs: OpAttrs::empty(),
+                        roles: OpRoles::empty(),
                         left: None,
                         right: None,
                         size: None,
@@ -2880,6 +3025,7 @@ impl<'state, 'arena> Parser<'state, 'arena> {
                     nodes.push(self.commit(Node::Operator {
                         op: primes_arr[0].as_op(),
                         attrs: OpAttrs::empty(),
+                        roles: OpRoles::empty(),
                         left: None,
                         right: None,
                         size: None,
@@ -2889,6 +3035,7 @@ impl<'state, 'arena> Parser<'state, 'arena> {
                         nodes.push(self.commit(Node::Operator {
                             op: primes_arr[0].as_op(),
                             attrs: OpAttrs::empty(),
+                            roles: OpRoles::empty(),
                             left: None,
                             right: None,
                             size: None,
@@ -2940,12 +3087,112 @@ impl<'state, 'arena> Parser<'state, 'arena> {
         Ok(ret_node)
     }
 
+    /// Wrap `content` in stretchy delimiters as a `mathinner` atom, like `\left...\right` does.
+    ///
+    /// This collects any sub- or superscripts and adds the spacing that a `mathinner` atom has
+    /// to its neighbors.
+    fn inner_fence(
+        &mut self,
+        content: Vec<&'arena Node<'arena>>,
+        open: Option<StretchableOp>,
+        close: Option<StretchableOp>,
+        parse_as: ParseAs,
+        prev_class: Class,
+    ) -> ParseResult<Node<'arena>> {
+        let options = FenceOptions {
+            open,
+            close,
+            ..FenceOptions::default()
+        };
+        if !parse_as.in_sequence() {
+            return Ok(fenced(self.arena, content, options));
+        }
+        // The spacing has to go outside of any sub- or superscripts,
+        // so we collect them here.
+        let bounds = self.get_bounds(None)?.ensure_no_explicit_limits()?;
+        // Compute the spacing after getting the bounds, so that we don't
+        // consider tokens that are part of the bounds for spacing calculations.
+        let next_class = self.peek_class_token(true)?;
+        let next_class = if self.state.right_boundary_hack && matches!(next_class, Class::End) {
+            Class::Default
+        } else {
+            next_class
+        };
+        let (left, right) = self.state.mathinner_spacing(prev_class, next_class, true);
+        // The delimiters have zero spacing by default, so we only need to set non-zero
+        // spacing explicitly.
+        let left = left.filter(|s| *s != MathSpacing::Zero);
+        let right = right.filter(|s| *s != MathSpacing::Zero);
+        if bounds.is_trivial() {
+            // Realize the spacing with `lspace`/`rspace` on the delimiters.
+            return Ok(fenced(
+                self.arena,
+                content,
+                FenceOptions {
+                    outer_left: left,
+                    outer_right: right,
+                    ..options
+                },
+            ));
+        }
+        // With scripts, an `rspace` on the closing delimiter would end up between the delimiter
+        // and the scripts, so we pad the scripted element instead. We avoid `<mpadded>` where
+        // possible, because it interacts badly with accents in Firefox.
+        let fence = self.commit(fenced(
+            self.arena,
+            content,
+            FenceOptions {
+                outer_left: left,
+                ..options
+            },
+        ));
+        let Some(scripted) = bounds.try_wrap_node_subsup(fence) else {
+            unreachable!("bounds are not trivial");
+        };
+        Ok(if right.is_some() {
+            Node::Padded {
+                node: self.commit(scripted),
+                width_0: false,
+                height_0: false,
+                left: None,
+                right,
+                voffset: None,
+            }
+        } else {
+            scripted
+        })
+    }
+
+    /// Whether the bounds of a pseudo-operator like `\lim` should be rendered with
+    /// `<munder>`/`<mover>` (as opposed to `<msub>`/`<msup>`).
+    ///
+    /// Instead of relying on `movablelimits`, we decide this based on the current style.
+    /// (The name of the operator is rendered as `<mi>`, which doesn't support `movablelimits`.)
+    fn pseudo_op_uses_underover(
+        &self,
+        bounds: Bounds<'arena>,
+        limits: Option<LimitsKind>,
+        limits_by_default: bool,
+    ) -> bool {
+        match (limits, limits_by_default) {
+            _ if bounds.is_trivial() => false,
+            (None, true) | (Some(LimitsKind::Display), _) => self.state.style == Style::Display,
+            (None, false) | (Some(LimitsKind::Never), _) => false,
+            (Some(LimitsKind::Always), _) => true,
+        }
+    }
+
     fn mathop_spacing(
         &mut self,
         parse_as: ParseAs,
         prev_class: Class,
         explicit: bool,
     ) -> ParseResult<(Option<MathSpacing>, Option<MathSpacing>)> {
+        if matches!(parse_as, ParseAs::Arg) {
+            // A lone argument like in `\mathrm\sin` has no neighbors to be spaced from.
+            let spacing = explicit.then_some(MathSpacing::Zero);
+            return Ok((spacing, spacing));
+        }
         // We re-determine the next class here, because the next token may have changed
         // because we discarded bounds tokens.
         let next_class = self.peek_class_token(parse_as.in_sequence())?;
@@ -3301,9 +3548,15 @@ impl ParserState<'_> {
         next_class: Class,
         force: bool,
     ) -> (Option<MathSpacing>, Option<MathSpacing>) {
+        // For `Class::Inner`, the spacing is already provided by the previous atom's right side.
         let left = if matches!(
             prev_class,
-            Class::Relation | Class::Punctuation | Class::Operator | Class::BinaryOp | Class::Open
+            Class::Relation
+                | Class::Punctuation
+                | Class::Operator
+                | Class::BinaryOp
+                | Class::Open
+                | Class::Inner
         ) || matches!(self.style, Style::Script | Style::ScriptScript)
         {
             Some(MathSpacing::Zero)
@@ -3335,24 +3588,9 @@ impl ParserState<'_> {
 pub(crate) fn node_vec_to_node<'arena>(
     arena: &'arena Arena,
     nodes: &[&'arena Node<'arena>],
-    reset_spacing: bool,
 ) -> &'arena Node<'arena> {
     if let [single] = nodes {
-        if reset_spacing {
-            if let Node::Operator { op, attrs, .. } = **single {
-                arena.push(Node::Operator {
-                    op,
-                    attrs,
-                    left: None,
-                    right: None,
-                    size: None,
-                })
-            } else {
-                single
-            }
-        } else {
-            single
-        }
+        single
     } else {
         let nodes = arena.push_slice(nodes);
         arena.push(Node::Row {

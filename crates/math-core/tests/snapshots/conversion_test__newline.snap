@@ -4,6 +4,5 @@ expression: "x\\\\y"
 ---
 <math>
     <mi>x</mi>
-    <mrow></mrow>
     <mi>y</mi>
 </math>

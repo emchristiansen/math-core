@@ -1,0 +1,13 @@
+---
+source: crates/math-core/tests/conversion_test.rs
+expression: "(\\left(x\\right))"
+---
+<math>
+    <mo stretchy="false">(</mo>
+    <mrow>
+        <mo>(</mo>
+        <mi>x</mi>
+        <mo>)</mo>
+    </mrow>
+    <mo stretchy="false">)</mo>
+</math>
