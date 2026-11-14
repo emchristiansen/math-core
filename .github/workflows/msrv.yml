@@ -21,4 +21,4 @@ jobs:
           toolchain: ${{ steps.msrv.outputs.version }}
       - uses: Swatinem/rust-cache@v2
       - name: "Build mathcore binary"
-        run: cargo build -p math-core-cli --bin mathcore
+        run: cargo +${{ steps.msrv.outputs.version }} build -p math-core-cli --bin mathcore
