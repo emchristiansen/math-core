@@ -345,7 +345,7 @@ impl<'state> Emitter<'state> {
             }
             Node::PseudoOp { left, right, name } => {
                 emit_operator_attributes(&mut self.s, OpAttrs::empty(), left, right)?;
-                write!(self.s, ">{name}</mo>")?;
+                write!(self.s, ">{}</mo>", EscapeHtml(name))?;
             }
             Node::IdentifierStr(letters) => {
                 // The "<mrow>" with "<mspace/>" is needed to prevent Firefox from adding
@@ -1166,6 +1166,18 @@ mod tests {
                 name: "sin"
             }),
             "<mo lspace=\"0.1667em\" rspace=\"0.1667em\">sin</mo>"
+        );
+    }
+
+    #[test]
+    fn render_pseudo_operator_escapes_text() {
+        assert_eq!(
+            render(&Node::PseudoOp {
+                left: None,
+                right: None,
+                name: "<b>x</b>&\"'"
+            }),
+            "<mo>&lt;b&gt;x&lt;/b&gt;&amp;&quot;&#39;</mo>"
         );
     }
 
